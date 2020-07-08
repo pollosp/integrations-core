@@ -110,9 +110,10 @@ class KafkaCheck(AgentCheck):
                 self._context_limit,
             )
 
-        # Report the metics
-        self._report_highwater_offsets()
-        self._report_consumer_offsets_and_lag()
+        # Report the metrics
+        context_available = self._context_limit
+        context_available -= self._report_highwater_offsets(context_available)
+        self._report_consumer_offsets_and_lag(context_available)
 
     def _create_kafka_admin_client(self, api_version):
         """Return a KafkaAdminClient."""
@@ -246,22 +247,34 @@ class KafkaCheck(AgentCheck):
                         "partition: %s." % (topic, partition)
                     )
 
-    def _report_highwater_offsets(self):
+    def _report_highwater_offsets(self, contexts_available):
         """Report the broker highwater offsets."""
+        reported_contexts = 0
+
         for (topic, partition), highwater_offset in self._highwater_offsets.items():
+            if reported_contexts >= contexts_available:
+                self.log.debug("Skipping remaining highwater offsets because context limit has been reached")
+                break
             broker_tags = ['topic:%s' % topic, 'partition:%s' % partition]
             broker_tags.extend(self._custom_tags)
             self.gauge('broker_offset', highwater_offset, tags=broker_tags)
+            reported_contexts += 1
+        return reported_contexts
 
-    def _report_consumer_offsets_and_lag(self):
+    def _report_consumer_offsets_and_lag(self, contexts_available):
         """Report the consumer offsets and consumer lag."""
+        reported_contexts = 0
         for (consumer_group, topic, partition), consumer_offset in self._consumer_offsets.items():
+            if reported_contexts >= contexts_available:
+                self.log.debug("Skipping remaining consumer and lag offsets because context limit has been reached")
+                break
             consumer_group_tags = ['topic:%s' % topic, 'partition:%s' % partition, 'consumer_group:%s' % consumer_group]
             consumer_group_tags.extend(self._custom_tags)
             if partition in self._kafka_client._client.cluster.partitions_for_topic(topic):
                 # report consumer offset if the partition is valid because even if leaderless the consumer offset will
                 # be valid once the leader failover completes
                 self.gauge('consumer_offset', consumer_offset, tags=consumer_group_tags)
+                reported_contexts += 1
                 if (topic, partition) not in self._highwater_offsets:
                     self.log.warning(
                         "Consumer group: %s has offsets for topic: %s partition: %s, but no stored highwater offset "
@@ -273,7 +286,9 @@ class KafkaCheck(AgentCheck):
                     continue
 
                 consumer_lag = self._highwater_offsets[(topic, partition)] - consumer_offset
-                self.gauge('consumer_lag', consumer_lag, tags=consumer_group_tags)
+                if reported_contexts < contexts_available:
+                    self.gauge('consumer_lag', consumer_lag, tags=consumer_group_tags)
+                    reported_contexts += 1
 
                 if consumer_lag < 0:
                     # this will effectively result in data loss, so emit an event for max visibility
@@ -296,6 +311,7 @@ class KafkaCheck(AgentCheck):
                     partition,
                 )
                 self._kafka_client._client.cluster.request_update()  # force metadata update on next poll()
+        return reported_contexts
 
     def _get_consumer_offsets(self):
         """Fetch Consumer Group offsets from Kafka.
